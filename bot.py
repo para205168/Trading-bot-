@@ -1,6 +1,8 @@
 # ==============================================================================
 # 1. IMPORTS, CONFIGURATION & TOKEN RESOLUTION
 # ==============================================================================
+from __future__ import annotations
+
 import argparse
 import asyncio
 from dataclasses import dataclass
@@ -20,8 +22,10 @@ from zoneinfo import ZoneInfo
 
 import matplotlib
 matplotlib.use("Agg")  # Headless rendering for Telegram PNG charts
+from matplotlib.backends.backend_agg import FigureCanvasAgg
+from matplotlib.figure import Figure
 from matplotlib.patches import Rectangle
-import matplotlib.pyplot as plt
+from matplotlib.ticker import FuncFormatter
 import numpy as np
 import pandas as pd
 from reportlab.lib import colors
@@ -55,8 +59,8 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Secrets must come from .env or environment variables (never hardcoded in source)
-TELEGRAM_BOT_TOKEN_FALLBACK = "9057810181:AAHLgGWodBUsR6vkGIXrOcmbNadnmSUrxkw"
-TELEGRAM_CHAT_ID_FALLBACK = "9091284226"
+TELEGRAM_BOT_TOKEN_FALLBACK = ""
+TELEGRAM_CHAT_ID_FALLBACK = ""
 
 STARTING_CAPITAL = 20000.00
 JOURNAL_FILE = Path("trade_journal.json")
@@ -78,6 +82,10 @@ HEADS_UP_COOLDOWN_HOURS = 12               # Cooldown between low-priority Heads
 AUTO_BUY_DEFAULT = True                    # Automatically track triggered entry signals in holdings.json
 MAX_AUTO_OPEN_POSITIONS = 5                # Max concurrent auto-bought positions
 AUTO_POSITION_PCT = 0.10                   # 10% of STARTING_CAPITAL per auto-bought trade
+MIN_ALERT_STRATEGIES = 2                   # Require at least 2 converging strategies for Entry alerts
+MIN_AUTO_BUY_SCORE = 75.0                  # Only Auto-Buy MEDIUM (75-85) or HIGH (>85) setups
+REQUIRE_SPY_ABOVE_200EMA = True            # Pause new entries when SPY is below its daily 200 EMA
+BREAKEVEN_R_TRIGGER = 1.0                  # Raise stop to breakeven once unrealized gain >= 1.0R
 
 TAG_ENTRY = "Entry \U0001f6aa"
 TAG_STOPLOSS = "Stop Loss \U0001f9f1\U0001f697"
@@ -94,10 +102,30 @@ ALL_STRATEGIES = [
 ]
 
 TOP_SPY_HOLDINGS = ["NVDA", "AAPL", "MSFT", "AMZN", "META", "AVGO", "GOOGL", "TSLA", "LLY", "BRK-B"]
+
+SECTOR_ETFS: dict[str, tuple[str, str]] = {
+    "XLK": ("Technology", "OFFENSIVE"),
+    "XLY": ("Consumer Disc.", "OFFENSIVE"),
+    "XLC": ("Comm. Services", "OFFENSIVE"),
+    "XLF": ("Financials", "CYCLICAL"),
+    "XLI": ("Industrials", "CYCLICAL"),
+    "XLE": ("Energy", "CYCLICAL"),
+    "XLB": ("Materials", "CYCLICAL"),
+    "XLV": ("Health Care", "DEFENSIVE"),
+    "XLP": ("Consumer Staples", "DEFENSIVE"),
+    "XLU": ("Utilities", "DEFENSIVE"),
+    "XLRE": ("Real Estate", "DEFENSIVE"),
+}
+
 TICKER_REGEX = re.compile(r"^[\$/]?([A-Za-z]{1,5}(?:[.-][A-Za-z]{1,2})?)$")
-RESERVED_COMMANDS = {"START", "HELP", "SCAN", "BORODEN", "AUTOBUY", "REGIME", "REPORT", "BUY", "SELL", "LEARN"}
+RESERVED_COMMANDS = {
+    "START", "HELP", "SCAN", "BORODEN", "AUTOBUY",
+    "REGIME", "SECTOR", "OPEN", "CLOSE", "CROSSOVER",
+    "PATTERN", "REPORT", "BUY", "SELL", "LEARN",
+}
 
 _STATE_LOCK = threading.RLock()
+_SCAN_LOCK = asyncio.Lock()
 
 
 def _load_env_files() -> None:
@@ -156,7 +184,7 @@ def resolve_telegram_token(cli_token: Optional[str] = None) -> str:
             return entered
 
     raise RuntimeError(
-        "TELEGRAM_BOT_TOKEN is not set. Create a .env file next to bot_4.py with "
+        "TELEGRAM_BOT_TOKEN is not set. Create a .env file next to bot_3.py with "
         "TELEGRAM_BOT_TOKEN=your_token, pass --token YOUR_TOKEN, or set the environment variable."
     )
 
@@ -333,16 +361,13 @@ def _default_ticker_profile(sym: str, base_cfg: Optional[Boroden4HConfig] = None
         "last_bar_seen": None,
         "volatility_regime": "STANDARD",
         "avg_atr_pct": None,
-        # Ticker-specific adaptive parameters (never shared with other tickers)
         "atr_stop_mult": round(cfg.atr_stop_mult, 2),
         "min_cluster": int(cfg.min_cluster),
         "min_rsi_reclaim": round(cfg.rsi_reclaim_level, 1),
         "vol_mult": round(cfg.vol_mult, 2),
         "tp_scale_mult": 1.00,
-        # Per-ticker strategy weights & win/loss counters
         "strategy_weights": {s: 1.00 for s in ALL_STRATEGIES},
         "strategy_stats": {s: {"wins": 0, "losses": 0} for s in ALL_STRATEGIES},
-        # Closed trade history, deduplicated trade keys, & shadow forward-test checkpoints
         "trade_events": [],
         "learned_trade_keys": [],
         "pending_signals": [],
@@ -421,6 +446,52 @@ def load_ticker_profiles() -> dict[str, dict[str, Any]]:
 
 def save_ticker_profiles(profiles: dict[str, dict[str, Any]]) -> None:
     _atomic_write_json(TICKER_LEARNER_FILE, profiles)
+
+
+def _merge_and_save_scanned_profiles(
+    scanned_profiles: dict[str, dict[str, Any]],
+    updated_syms: set[str],
+) -> None:
+    """Atomically merge scanned per-ticker DNA updates without clobbering concurrent trade outcomes."""
+    if not updated_syms:
+        return
+    with _STATE_LOCK:
+        disk_profiles = load_ticker_profiles()
+        for sym in updated_syms:
+            if sym not in scanned_profiles:
+                continue
+            scan_p = scanned_profiles[sym]
+            disk_p = disk_profiles.get(sym)
+            if disk_p is None:
+                disk_profiles[sym] = scan_p
+                continue
+
+            disk_keys = set(disk_p.get("learned_trade_keys", []))
+            scan_keys = set(scan_p.get("learned_trade_keys", []))
+            new_disk_keys = disk_keys - scan_keys
+            if new_disk_keys:
+                for k in ("volatility_regime", "avg_atr_pct", "last_bar_seen", "pending_signals"):
+                    disk_p[k] = scan_p.get(k)
+                disk_p["atr_stop_mult"] = max(
+                    float(disk_p.get("atr_stop_mult", 1.25)),
+                    float(scan_p.get("atr_stop_mult", 1.25)),
+                )
+                disk_p["min_cluster"] = max(
+                    int(disk_p.get("min_cluster", 2)),
+                    int(scan_p.get("min_cluster", 2)),
+                )
+                disk_p["min_rsi_reclaim"] = max(
+                    float(disk_p.get("min_rsi_reclaim", 42.0)),
+                    float(scan_p.get("min_rsi_reclaim", 42.0)),
+                )
+                disk_p["vol_mult"] = max(
+                    float(disk_p.get("vol_mult", 1.20)),
+                    float(scan_p.get("vol_mult", 1.20)),
+                )
+                disk_profiles[sym] = disk_p
+            else:
+                disk_profiles[sym] = scan_p
+        save_ticker_profiles(disk_profiles)
 
 
 def get_ticker_learning_profile(
@@ -614,7 +685,6 @@ def upgrade_ticker_learning_profile(
         daily_dt_index = _to_naive_et_index(daily_df.index) if (daily_df is not None and not daily_df.empty) else None
         latest_bar_str = str(dt_index[-1])
 
-        # 1. Calibrate ticker's own volatility DNA (ATR % of price)
         atr_series = compute_atr(recent_df, cfg.atr_period)
         atr_pct = float((atr_series.iloc[-1] / max(float(recent_df["close"].iloc[-1]), 1e-6)) * 100.0)
         prev_atr_pct = prof.get("avg_atr_pct")
@@ -639,7 +709,6 @@ def upgrade_ticker_learning_profile(
             prof["atr_stop_mult"] = round(floor_atr_mult, 2)
             changes.append(f"ATRx->{prof['atr_stop_mult']:.2f}")
 
-        # 2. Timestamp-accurate post-exit observation on closed trades (strictly bars AFTER exit_time in ET)
         for ev in prof.get("trade_events", []):
             if ev.get("post_exit_observed"):
                 continue
@@ -682,7 +751,6 @@ def upgrade_ticker_learning_profile(
                     ev["post_exit_behavior"] = "target_fade"
                 ev["post_exit_observed"] = True
 
-        # 3. Verify pending shadow signals against their matching timeframe (`1D` vs `4H`)
         still_pending: list[dict[str, Any]] = []
         for sig in prof.get("pending_signals", []):
             sig_ts = _to_naive_et_timestamp(sig.get("signal_time"))
@@ -690,7 +758,10 @@ def upgrade_ticker_learning_profile(
                 continue
 
             sig_tf = str(sig.get("tf", "4H")).upper()
-            if sig_tf == "1D" and daily_df is not None and daily_dt_index is not None:
+            if sig_tf == "1D":
+                if daily_df is None or daily_dt_index is None:
+                    still_pending.append(sig)
+                    continue
                 eval_df = daily_df
                 eval_idx = daily_dt_index
             else:
@@ -781,6 +852,7 @@ def record_position_buy(
         holdings[sym] = {
             "entry": round(float(entry_px), 4),
             "stop": round(float(stop_px), 4),
+            "initial_risk": round(max(float(entry_px) - float(stop_px), 0.0), 4),
             "target": round(float(target_px), 4),
             "shares": round(float(shares), 4),
             "strategy": strategy,
@@ -871,7 +943,7 @@ def record_position_close(
 
 
 # ==============================================================================
-# 3. MARKET DATA FETCHERS, TECHNICAL INDICATORS & PATTERN DETECTORS
+# 3. MARKET DATA FETCHERS, TECHNICAL INDICATORS, CROSSOVERS & PATTERNS
 # ==============================================================================
 def _normalize_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
     """Normalize yfinance DataFrame to lowercase open/high/low/close/volume."""
@@ -886,7 +958,7 @@ def _normalize_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
     required = ["open", "high", "low", "close", "volume"]
     if not all(col in out.columns for col in required):
         return pd.DataFrame()
-    return out[required].dropna(subset=["close"]).sort_index()
+    return out[required].dropna(subset=["open", "high", "low", "close"]).sort_index()
 
 
 def _resample_to_4h(df: pd.DataFrame) -> pd.DataFrame:
@@ -958,13 +1030,7 @@ def fetch_yf_batch_ohlcv(tickers: list[str], period: str = "6mo", interval: str 
             )
             if raw is None or raw.empty:
                 continue
-            if len(chunk) == 1:
-                norm = _normalize_ohlcv(raw)
-                if resample_4h:
-                    norm = _resample_to_4h(norm)
-                if not norm.empty:
-                    result[chunk[0]] = norm
-            elif isinstance(raw.columns, pd.MultiIndex):
+            if isinstance(raw.columns, pd.MultiIndex):
                 level0 = set(raw.columns.get_level_values(0))
                 for sym in chunk:
                     if sym in level0:
@@ -973,6 +1039,12 @@ def fetch_yf_batch_ohlcv(tickers: list[str], period: str = "6mo", interval: str 
                             norm = _resample_to_4h(norm)
                         if not norm.empty:
                             result[sym] = norm
+            elif len(chunk) == 1:
+                norm = _normalize_ohlcv(raw)
+                if resample_4h:
+                    norm = _resample_to_4h(norm)
+                if not norm.empty:
+                    result[chunk[0]] = norm
         except Exception as exc:
             logger.warning("Batch download error for %s...: %s", chunk[:3], exc)
     return result
@@ -1003,7 +1075,10 @@ def get_sp500_and_nasdaq100_tickers() -> list[str]:
         resp.raise_for_status()
         sp500_tables = pd.read_html(io.StringIO(resp.text))
         sp500_col = "Symbol" if "Symbol" in sp500_tables[0].columns else sp500_tables[0].columns[0]
-        tickers.update(str(t).strip().upper().replace(".", "-") for t in sp500_tables[0][sp500_col].dropna())
+        for raw_t in sp500_tables[0][sp500_col].dropna():
+            sym = str(raw_t).strip().upper().replace(".", "-")
+            if re.fullmatch(r"[A-Z]{1,5}(?:-[A-Z]{1,2})?", sym):
+                tickers.add(sym)
     except Exception as exc:
         logger.warning("Could not fetch S&P 500 list dynamically: %s", exc)
     try:
@@ -1017,7 +1092,10 @@ def get_sp500_and_nasdaq100_tickers() -> list[str]:
         for tbl in ndx_tables:
             for col in ("Ticker", "Symbol"):
                 if col in tbl.columns:
-                    tickers.update(str(t).strip().upper().replace(".", "-") for t in tbl[col].dropna())
+                    for raw_t in tbl[col].dropna():
+                        sym = str(raw_t).strip().upper().replace(".", "-")
+                        if re.fullmatch(r"[A-Z]{1,5}(?:-[A-Z]{1,2})?", sym):
+                            tickers.add(sym)
                     break
     except Exception as exc:
         logger.warning("Could not fetch Nasdaq-100 list dynamically: %s", exc)
@@ -1195,12 +1273,84 @@ def detect_butterfly_harmonic(df: pd.DataFrame, pivot_len: int = 3, tol: float =
     return None
 
 
-def detect_heads_up_setups(df: pd.DataFrame) -> list[str]:
-    """Low-priority 'Heads-Up Watch' detector (EMA pre-crosses + Cup & Handle, Bull Flag, Falling Wedge, Butterfly)."""
-    if df is None or len(df) < 60:
+def detect_ema_crossovers(df: pd.DataFrame) -> list[dict[str, Any]]:
+    """Detect confirmed and imminent bullish EMA crossovers (9/21, 21/50, 50/200 Golden Cross)."""
+    if df is None or len(df) < 55:
         return []
 
-    notes: list[str] = []
+    close = df["close"]
+    cur_close = float(close.iloc[-1])
+    if np.isnan(cur_close) or cur_close <= 0:
+        return []
+
+    ema9 = compute_ema(close, 9)
+    ema21 = compute_ema(close, 21)
+    ema50 = compute_ema(close, 50)
+    ema200 = compute_ema(close, 200)
+
+    hits: list[dict[str, Any]] = []
+
+    # 1. EMA 9 / 21 Bullish Crossover (Confirmed or Imminent)
+    prev_gap_9_21 = float(ema21.iloc[-2] - ema9.iloc[-2])
+    curr_gap_9_21 = float(ema21.iloc[-1] - ema9.iloc[-1])
+    gap_pct_9_21 = (curr_gap_9_21 / cur_close) * 100.0
+    if prev_gap_9_21 >= 0 and curr_gap_9_21 < 0:
+        hits.append({
+            "pair": "9/21",
+            "status": "CONFIRMED",
+            "label": "⚡ EMA 9/21 Bullish Crossover (Confirmed)",
+        })
+    elif 0 < gap_pct_9_21 <= 0.45 and curr_gap_9_21 < prev_gap_9_21 and cur_close > float(ema9.iloc[-1]):
+        hits.append({
+            "pair": "9/21",
+            "status": "IMMINENT",
+            "label": f"⏳ EMA 9/21 About to Cross (gap {gap_pct_9_21:.2f}%)",
+        })
+
+    # 2. EMA 21 / 50 Bullish Crossover (Confirmed or Imminent)
+    prev_gap_21_50 = float(ema50.iloc[-2] - ema21.iloc[-2])
+    curr_gap_21_50 = float(ema50.iloc[-1] - ema21.iloc[-1])
+    gap_pct_21_50 = (curr_gap_21_50 / cur_close) * 100.0
+    if prev_gap_21_50 >= 0 and curr_gap_21_50 < 0:
+        hits.append({
+            "pair": "21/50",
+            "status": "CONFIRMED",
+            "label": "⚡ EMA 21/50 Bullish Crossover (Confirmed)",
+        })
+    elif 0 < gap_pct_21_50 <= 0.60 and curr_gap_21_50 < prev_gap_21_50 and cur_close > float(ema21.iloc[-1]):
+        hits.append({
+            "pair": "21/50",
+            "status": "IMMINENT",
+            "label": f"⏳ EMA 21/50 About to Cross (gap {gap_pct_21_50:.2f}%)",
+        })
+
+    # 3. EMA 50 / 200 Golden Cross (Confirmed or Imminent)
+    if len(df) >= 200:
+        prev_gap_50_200 = float(ema200.iloc[-2] - ema50.iloc[-2])
+        curr_gap_50_200 = float(ema200.iloc[-1] - ema50.iloc[-1])
+        gap_pct_50_200 = (curr_gap_50_200 / cur_close) * 100.0
+        if prev_gap_50_200 >= 0 and curr_gap_50_200 < 0:
+            hits.append({
+                "pair": "50/200",
+                "status": "CONFIRMED",
+                "label": "🌟 EMA 50/200 Golden Cross (Confirmed)",
+            })
+        elif 0 < gap_pct_50_200 <= 0.80 and curr_gap_50_200 < prev_gap_50_200 and cur_close > float(ema50.iloc[-1]):
+            hits.append({
+                "pair": "50/200",
+                "status": "IMMINENT",
+                "label": f"⏳ EMA 50/200 Golden Cross Approaching (gap {gap_pct_50_200:.2f}%)",
+            })
+
+    return hits
+
+
+def detect_chart_patterns(df: pd.DataFrame) -> list[dict[str, str]]:
+    """Detect active bullish chart & harmonic patterns (Bull Flag, Falling Wedge, Cup & Handle, Double Bottom, Butterfly)."""
+    if df is None or len(df) < 50:
+        return []
+
+    patterns: list[dict[str, str]] = []
     close = df["close"]
     high = df["high"]
     low = df["low"]
@@ -1209,28 +1359,7 @@ def detect_heads_up_setups(df: pd.DataFrame) -> list[str]:
     if np.isnan(cur_close) or cur_close <= 0:
         return []
 
-    ema9 = compute_ema(close, 9)
-    ema21 = compute_ema(close, 21)
-    ema50 = compute_ema(close, 50)
-
-    prev_gap_9_21 = float(ema21.iloc[-2] - ema9.iloc[-2])
-    curr_gap_9_21 = float(ema21.iloc[-1] - ema9.iloc[-1])
-    gap_pct_9_21 = (curr_gap_9_21 / cur_close) * 100.0
-
-    if prev_gap_9_21 >= 0 and curr_gap_9_21 < 0:
-        notes.append("⚡ EMA 9/21 Bullish Cross just occurred")
-    elif 0 < gap_pct_9_21 <= 0.45 and curr_gap_9_21 < prev_gap_9_21 and cur_close > float(ema9.iloc[-1]):
-        notes.append(f"⏳ EMA 9/21 About to Cross (gap narrowing: {gap_pct_9_21:.2f}%)")
-
-    prev_gap_21_50 = float(ema50.iloc[-2] - ema21.iloc[-2])
-    curr_gap_21_50 = float(ema50.iloc[-1] - ema21.iloc[-1])
-    gap_pct_21_50 = (curr_gap_21_50 / cur_close) * 100.0
-
-    if prev_gap_21_50 >= 0 and curr_gap_21_50 < 0:
-        notes.append("⚡ EMA 21/50 Bullish Cross just occurred")
-    elif 0 < gap_pct_21_50 <= 0.60 and curr_gap_21_50 < prev_gap_21_50 and cur_close > float(ema21.iloc[-1]):
-        notes.append(f"⏳ EMA 21/50 About to Cross (gap narrowing: {gap_pct_21_50:.2f}%)")
-
+    # 1. Bull Flag
     pole_base = float(close.iloc[-16])
     pole_top = float(close.iloc[-6])
     flag_high = float(high.iloc[-6:-1].max())
@@ -1240,8 +1369,13 @@ def detect_heads_up_setups(df: pd.DataFrame) -> list[str]:
         vol_recent = float(vol.iloc[-5:].mean())
         vol_pole = float(vol.iloc[-15:-5].mean())
         if pole_return >= 0.06 and 0.01 <= flag_pullback <= 0.045 and vol_pole > 0 and vol_recent < vol_pole * 0.85:
-            notes.append("🚩 Bull Flag forming (tight consolidation after impulse move)")
+            patterns.append({
+                "key": "FLAG",
+                "name": "Bull Flag",
+                "label": f"🚩 Bull Flag (pole +{pole_return*100:.1f}%, tight pullback -{flag_pullback*100:.1f}%)",
+            })
 
+    # 2. Falling Wedge
     h_tail = high.iloc[-20:].to_numpy(dtype=float)
     l_tail = low.iloc[-20:].to_numpy(dtype=float)
     if not np.isnan(h_tail).any() and not np.isnan(l_tail).any():
@@ -1252,8 +1386,13 @@ def detect_heads_up_setups(df: pd.DataFrame) -> list[str]:
             spread_start = float(h_tail[0] - l_tail[0])
             spread_now = float(h_tail[-1] - l_tail[-1])
             if spread_start > 0 and spread_now < spread_start * 0.65:
-                notes.append("📐 Falling Wedge compression (bullish breakout watch)")
+                patterns.append({
+                    "key": "WEDGE",
+                    "name": "Falling Wedge",
+                    "label": "📐 Falling Wedge (converging downward channel compression)",
+                })
 
+    # 3. Cup & Handle
     window = close.iloc[-50:]
     left_rim = float(window.iloc[:10].max())
     cup_bottom = float(window.iloc[12:38].min())
@@ -1263,13 +1402,58 @@ def detect_heads_up_setups(df: pd.DataFrame) -> list[str]:
         cup_depth = (left_rim - cup_bottom) / left_rim
         rim_diff = abs(left_rim - right_rim) / left_rim
         handle_drop = (right_rim - handle_low) / right_rim
-        if 0.08 <= cup_depth <= 0.30 and rim_diff <= 0.03 and 0.01 <= handle_drop <= 0.08:
-            notes.append("☕ Cup & Handle structure forming near resistance")
+        if (
+            0.08 <= cup_depth <= 0.30
+            and rim_diff <= 0.03
+            and 0.01 <= handle_drop <= 0.08
+            and cur_close > handle_low
+            and cur_close >= right_rim * 0.94
+        ):
+            patterns.append({
+                "key": "CUP",
+                "name": "Cup & Handle",
+                "label": f"☕ Cup & Handle (cup -{cup_depth*100:.1f}%, handle -{handle_drop*100:.1f}%, rim ${right_rim:.2f})",
+            })
 
+    # 4. Double Bottom (W-Pattern)
+    lows_35 = low.iloc[-35:].to_numpy(dtype=float)
+    highs_35 = high.iloc[-35:].to_numpy(dtype=float)
+    if not np.isnan(lows_35).any() and not np.isnan(highs_35).any():
+        first_half_idx = int(np.argmin(lows_35[:16]))
+        second_half_idx = 18 + int(np.argmin(lows_35[18:33]))
+        low1 = float(lows_35[first_half_idx])
+        low2 = float(lows_35[second_half_idx])
+        if low1 > 0 and abs(low1 - low2) / low1 <= 0.018:
+            neckline = float(np.max(highs_35[first_half_idx : second_half_idx + 1]))
+            mid_bounce = (neckline - min(low1, low2)) / min(low1, low2)
+            if mid_bounce >= 0.04 and cur_close >= low2 * 1.01 and cur_close <= neckline * 1.02:
+                patterns.append({
+                    "key": "DOUBLE",
+                    "name": "Double Bottom",
+                    "label": f"🇼 Double Bottom (support ${min(low1, low2):.2f}, neckline ${neckline:.2f})",
+                })
+
+    # 5. Bullish Butterfly Harmonic
     butterfly_note = detect_butterfly_harmonic(df)
     if butterfly_note:
-        notes.append(butterfly_note)
+        patterns.append({
+            "key": "BUTTERFLY",
+            "name": "Bullish Butterfly Harmonic",
+            "label": butterfly_note,
+        })
 
+    return patterns
+
+
+def detect_heads_up_setups(df: pd.DataFrame) -> list[str]:
+    """Low-priority 'Heads-Up Watch' detector combining EMA crossovers and chart patterns."""
+    if df is None or len(df) < 55:
+        return []
+    notes: list[str] = []
+    for cx in detect_ema_crossovers(df):
+        notes.append(cx["label"])
+    for pat in detect_chart_patterns(df):
+        notes.append(pat["label"])
     return notes
 
 
@@ -1335,10 +1519,11 @@ def generate_trade_candlestick_chart(
         if aligned_auto is not None:
             stop_idx = int(np.argmin(np.abs(dt_index - np.datetime64(aligned_auto))))
 
-    fig, (ax_price, ax_vol) = plt.subplots(
+    fig = Figure(figsize=(11.5, 6.8))
+    FigureCanvasAgg(fig)
+    ax_price, ax_vol = fig.subplots(
         2,
         1,
-        figsize=(11.5, 6.8),
         gridspec_kw={"height_ratios": [4.2, 1.0]},
         sharex=True,
     )
@@ -1379,7 +1564,7 @@ def generate_trade_candlestick_chart(
 
     ax_price.plot(x, ema21, color="#38BDF8", linewidth=1.25, alpha=0.85, label="EMA 21", zorder=5)
 
-    x_min, x_max = -0.8, n + 6.4
+    x_min, x_max = -0.8, n + max(11.0, n * 0.28)
     zone_end = n + 0.35
     if stop_px < entry_px:
         ax_price.fill_between([entry_idx, zone_end], stop_px, entry_px, color="#EF4444", alpha=0.16, zorder=1)
@@ -1468,17 +1653,17 @@ def generate_trade_candlestick_chart(
     ax_vol.bar(x, vols, width=0.6, color=vol_colors, alpha=0.65, zorder=3)
     ax_vol.axvline(entry_idx, color="#60A5FA", linestyle=":", linewidth=1.3, alpha=0.9, zorder=2)
     ax_vol.set_ylabel("Volume", color=text_color, fontsize=8.5)
-    ax_vol.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f"{v/1e6:.1f}M" if v >= 1e6 else f"{v/1e3:.0f}K"))
-
+    ax_vol.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v/1e6:.1f}M" if v >= 1e6 else f"{v/1e3:.0f}K"))
     tick_step = max(1, n // 7)
     extra_ticks = [entry_idx, n - 1] + ([stop_idx] if stop_idx is not None else [])
     tick_positions = sorted(set(list(range(0, n, tick_step)) + extra_ticks))
     ax_vol.set_xticks(tick_positions)
     ax_vol.set_xticklabels([pd.Timestamp(dt_index[idx]).strftime(date_fmt) for idx in tick_positions], rotation=20, ha="right", color=text_color, fontsize=8)
 
-    visible_levels = [float(np.min(lows)), float(np.max(highs)), entry_px, stop_px, tp1_px, cur_px]
+    visible_levels = [float(np.nanmin(lows)), float(np.nanmax(highs)), entry_px, stop_px, tp1_px, cur_px]
     if tp2 is not None and not np.isnan(tp2) and tp2 > 0:
         visible_levels.append(float(tp2))
+    visible_levels = [v for v in visible_levels if not np.isnan(v)]
     y_min = min(visible_levels)
     y_max = max(visible_levels)
     y_pad = max((y_max - y_min) * 0.09, cur_px * 0.01)
@@ -1497,16 +1682,15 @@ def generate_trade_candlestick_chart(
     )
     ax_price.legend(loc="upper left", facecolor="#1E293B", edgecolor="#334155", labelcolor=text_color, fontsize=8)
 
-    plt.tight_layout()
+    fig.tight_layout()
     buf = io.BytesIO()
     fig.savefig(buf, format="png", dpi=150, facecolor=fig.get_facecolor())
-    plt.close(fig)
     buf.seek(0)
     return buf
 
 
 # ==============================================================================
-# 5. BORODEN 4H FIBONACCI ENGINE, SPY 200EMA CYCLES & PER-TICKER SCORING
+# 5. BORODEN 4H FIBONACCI ENGINE, SPY CYCLES, SECTOR MONEY FLOW & SCORING
 # ==============================================================================
 def score_strategy_confluence(
     matched_strategies: list[str],
@@ -1607,7 +1791,7 @@ def count_fib_cluster(ref_price: float, levels: list[Optional[float]], tol_pct: 
 
 
 def _align_daily_trend_to_4h(df_4h: pd.DataFrame, daily_df: Optional[pd.DataFrame]) -> pd.Series:
-    """Return boolean Series aligned to df_4h: True when Daily close >= Daily EMA50."""
+    """Return boolean Series aligned to df_4h: True when the latest completed Daily close >= Daily EMA50."""
     if daily_df is None or daily_df.empty or len(daily_df) < 20:
         return pd.Series(True, index=df_4h.index)
     d = daily_df.copy().sort_index()
@@ -1615,7 +1799,8 @@ def _align_daily_trend_to_4h(df_4h: pd.DataFrame, daily_df: Optional[pd.DataFram
     d["daily_bull"] = d["close"] >= d["daily_ema50"]
 
     idx_4h = _to_naive_et_index(df_4h.index)
-    idx_d = _to_naive_et_index(d.index)
+    # Daily bars from yfinance are stamped at 00:00; shift to 16:00 ET market close to avoid same-day lookahead
+    idx_d = _to_naive_et_index(d.index).normalize() + pd.Timedelta(hours=16)
     d_aligned = pd.DataFrame({"daily_bull": d["daily_bull"].values}, index=idx_d).sort_index()
     h4_frame = pd.DataFrame(index=idx_4h).sort_index()
     merged = pd.merge_asof(h4_frame, d_aligned, left_index=True, right_index=True, direction="backward")
@@ -1785,7 +1970,6 @@ def evaluate_boroden_4h_signals(
         candle_body_ok = (c > o) and (c > l + (h - l) * 0.4)
         bullish_candle = candle_body_ok and rsi_reclaim
 
-        # Pace-adjust volume check on the currently forming bar so early-session bars aren't unfairly penalized
         bar_pace = live_bar_progress if (i == n - 1) else 1.0
         vol_ok = vol_arr[i] >= (vol_sma_arr[i] * eff_vol_mult * bar_pace)
 
@@ -1892,7 +2076,7 @@ def run_boroden_4h_backtest(
                     "qty": remaining_qty,
                     "pnl": pnl,
                 })
-                if learn_mistakes and ticker and pnl != 0:
+                if learn_mistakes and ticker and pnl != 0 and reason != "BREAKEVEN_STOP":
                     bt_key = f"BT:{entry_time}:{idx}:{reason}"
                     record_ticker_trade_outcome(
                         ticker,
@@ -2107,6 +2291,93 @@ def rank_bounce_and_divergence_leaders(
     return ranked.reset_index(drop=True)
 
 
+def analyze_sector_money_flow() -> dict[str, Any]:
+    """Rank all 11 S&P 500 Sector ETFs by 20D Chaikin Money Flow (CMF), Relative Strength vs SPY, and EMA trend."""
+    tickers = ["SPY"] + list(SECTOR_ETFS.keys())
+    data_map = fetch_yf_batch_ohlcv(tickers, period="3mo", interval="1d")
+    spy_df = data_map.get("SPY")
+
+    spy_5d = 0.0
+    spy_20d = 0.0
+    if spy_df is not None and len(spy_df) >= 21:
+        spy_5d = (float(spy_df["close"].iloc[-1]) / float(spy_df["close"].iloc[-6]) - 1.0) * 100.0
+        spy_20d = (float(spy_df["close"].iloc[-1]) / float(spy_df["close"].iloc[-21]) - 1.0) * 100.0
+
+    rows: list[dict[str, Any]] = []
+    for sym, (name, bucket) in SECTOR_ETFS.items():
+        df = data_map.get(sym)
+        if df is None or len(df) < 21:
+            continue
+
+        close = df["close"]
+        cur_px = float(close.iloc[-1])
+        ret_5d = (cur_px / float(close.iloc[-6]) - 1.0) * 100.0
+        ret_20d = (cur_px / float(close.iloc[-21]) - 1.0) * 100.0
+        rel_20d = ret_20d - spy_20d
+
+        ema21 = float(compute_ema(close, 21).iloc[-1])
+        ema50 = float(compute_ema(close, 50).iloc[-1])
+        above_emas = cur_px > ema21 and cur_px > ema50
+
+        # 20-day Chaikin Money Flow (CMF): > +0.05 = Institutional Inflow, < -0.05 = Outflow
+        sub20 = df.iloc[-20:]
+        hl_range = (sub20["high"] - sub20["low"]).replace(0.0, np.nan)
+        mf_mult = ((sub20["close"] - sub20["low"]) - (sub20["high"] - sub20["close"])) / hl_range
+        mf_vol = (mf_mult.fillna(0.0) * sub20["volume"]).sum()
+        vol_sum = float(sub20["volume"].sum())
+        cmf_20 = float(mf_vol / vol_sum) if vol_sum > 0 else 0.0
+
+        vol_avg20 = float(sub20["volume"].mean())
+        rvol = float(df["volume"].iloc[-1]) / vol_avg20 if vol_avg20 > 0 else 1.0
+
+        flow_score = (cmf_20 * 100.0) + (rel_20d * 1.2) + ((ret_5d - spy_5d) * 0.8)
+
+        if cmf_20 >= 0.05 and rel_20d > 0 and above_emas:
+            status = "🟢 STRONG INFLOW"
+        elif cmf_20 > 0 or rel_20d > 0:
+            status = "🟡 ROTATING IN"
+        elif cmf_20 <= -0.05 and rel_20d < 0:
+            status = "🔴 HEAVY OUTFLOW"
+        else:
+            status = "⚪ LAGGING"
+
+        rows.append({
+            "ticker": sym,
+            "name": name,
+            "bucket": bucket,
+            "price": cur_px,
+            "ret_5d": ret_5d,
+            "ret_20d": ret_20d,
+            "rel_20d": rel_20d,
+            "cmf_20": cmf_20,
+            "rvol": rvol,
+            "above_emas": above_emas,
+            "status": status,
+            "flow_score": flow_score,
+        })
+
+    rows.sort(key=lambda r: r["flow_score"], reverse=True)
+
+    off_rows = [r for r in rows if r["bucket"] in ("OFFENSIVE", "CYCLICAL")]
+    def_rows = [r for r in rows if r["bucket"] == "DEFENSIVE"]
+    off_avg_rel = sum(r["rel_20d"] for r in off_rows) / len(off_rows) if off_rows else 0.0
+    def_avg_rel = sum(r["rel_20d"] for r in def_rows) / len(def_rows) if def_rows else 0.0
+
+    if off_avg_rel > def_avg_rel + 0.5:
+        rotation_regime = "🚀 RISK-ON (Money flowing into Growth & Cyclicals)"
+    elif def_avg_rel > off_avg_rel + 0.5:
+        rotation_regime = "🛡️ RISK-OFF (Money rotating into Defensives)"
+    else:
+        rotation_regime = "⚖️ MIXED / SELECTIVE ROTATION"
+
+    return {
+        "sectors": rows,
+        "spy_5d": spy_5d,
+        "spy_20d": spy_20d,
+        "rotation_regime": rotation_regime,
+    }
+
+
 def evaluate_setup_signals(
     df: pd.DataFrame,
     ipo_anchor_idx: Optional[int] = None,
@@ -2216,6 +2487,34 @@ def _truncate_telegram(text: str, max_len: int = TELEGRAM_MAX_LEN) -> str:
     if len(text) <= max_len:
         return text
     return text[: max_len - 30] + "\n<i>...(truncated)</i>"
+
+
+def _split_telegram_chunks(text: str, max_len: int = TELEGRAM_MAX_LEN) -> list[str]:
+    """Split long HTML messages cleanly on line breaks so nothing is lost."""
+    if len(text) <= max_len:
+        return [text]
+    chunks: list[str] = []
+    current_lines: list[str] = []
+    current_len = 0
+    for line in text.splitlines():
+        add_len = len(line) + 1
+        if current_lines and (current_len + add_len) > max_len:
+            chunks.append("\n".join(current_lines))
+            current_lines = [line]
+            current_len = len(line)
+        else:
+            current_lines.append(line)
+            current_len += add_len
+    if current_lines:
+        chunks.append("\n".join(current_lines))
+    return chunks
+
+
+async def _reply_long_html(update: Update, text: str) -> None:
+    if not update.message:
+        return
+    for chunk in _split_telegram_chunks(text):
+        await update.message.reply_text(chunk, parse_mode="HTML")
 
 
 def _get_week_bounds(now_ct: datetime) -> tuple[datetime, datetime]:
@@ -2485,8 +2784,16 @@ async def evaluate_market(
 ) -> dict[str, Any]:
     """
     Evaluate universe + holdings for Entry, Sell, Stop Loss, Target, and Heads-Up Watch alerts.
-    Loads ticker profiles once into memory, updates all tickers in-memory, and writes once at the end.
+    Loads ticker profiles once into memory, updates all tickers in-memory, and merges atomically at the end.
     """
+    spy_below_200ema = False
+    if universe and REQUIRE_SPY_ABOVE_200EMA:
+        spy_df = await asyncio.to_thread(fetch_yf_ohlcv, "SPY", "1y", "1d")
+        if not spy_df.empty and len(spy_df) >= 200:
+            spy_ema200 = float(compute_ema(spy_df["close"], 200).iloc[-1])
+            spy_close = float(spy_df["close"].iloc[-1])
+            spy_below_200ema = spy_close < spy_ema200
+
     all_symbols = sorted(set(universe) | set(holdings.keys()))
     raw_map = await asyncio.to_thread(fetch_yf_batch_ohlcv, all_symbols, "6mo", "1d")
 
@@ -2503,6 +2810,7 @@ async def evaluate_market(
 
     boroden_cfg = Boroden4HConfig()
     profiles_cache = load_ticker_profiles()
+    updated_syms: set[str] = set()
 
     buy_alerts: list[str] = []
     buy_signals: list[dict[str, Any]] = []
@@ -2523,17 +2831,16 @@ async def evaluate_market(
         if chart_df is None or chart_df.empty:
             continue
 
-        # Upgrade THIS ticker's isolated learning profile in memory (batch saved at end of scan)
         ticker_prof = upgrade_ticker_learning_profile(
             sym, chart_df, boroden_cfg, daily_df=df, profiles_cache=profiles_cache, defer_save=True
         )
+        updated_syms.add(sym)
 
         matched_strategies: list[str] = []
         sig_df = pd.DataFrame()
         b4h_df = pd.DataFrame()
         vol_ratio = 1.0
 
-        # 1. Evaluate Daily Strategy Engines
         if df is not None and len(df) >= 20:
             sig_df = evaluate_setup_signals(df, vol_mult=max(1.35, float(ticker_prof.get("vol_mult", 1.20)) + 0.25))
             last_d = sig_df.iloc[-1]
@@ -2555,7 +2862,6 @@ async def evaluate_market(
             ):
                 matched_strategies.append("IPO VWAP + Volume Reversal")
 
-        # 2. Evaluate 4H Boroden Fib Cluster Engine (using THIS ticker's learned parameters)
         boroden_fired = False
         if df_4h is not None and len(df_4h) >= (2 * boroden_cfg.pivot_len + 5):
             b4h_df = evaluate_boroden_4h_signals(
@@ -2566,12 +2872,18 @@ async def evaluate_market(
                 boroden_fired = True
                 matched_strategies.append("4H Boroden Fib Cluster")
 
-        # 3. Evaluate Bullish Butterfly Harmonic
         if len(chart_df) >= 35 and detect_butterfly_harmonic(chart_df) is not None:
-            matched_strategies.append("Bullish Butterfly Harmonic")
+           matched_strategies.append("Bullish Butterfly Harmonic")
 
-        # 4. Score Confluence using THIS ticker's strategy weights & Ignore if 0 matched
-        if matched_strategies:
+        trend_4h_ok = True
+        if not b4h_df.empty and "trend_allows_long_4h" in b4h_df.columns:
+            trend_4h_ok = bool(b4h_df.iloc[-1]["trend_allows_long_4h"])
+
+        if (
+            not spy_below_200ema
+            and trend_4h_ok
+            and len(set(matched_strategies)) >= MIN_ALERT_STRATEGIES
+        ):
             if boroden_fired and not b4h_df.empty:
                 last_4h = b4h_df.iloc[-1]
                 entry_px = float(last_4h["close"])
@@ -2647,7 +2959,7 @@ async def evaluate_market(
                     "message": msg,
                 })
 
-        if len(chart_df) >= 60:
+        if len(chart_df) >= 55:
             hu_notes = detect_heads_up_setups(chart_df)
             if hu_notes:
                 heads_up_signals.append({
@@ -2657,14 +2969,12 @@ async def evaluate_market(
                     "notes": hu_notes,
                 })
 
-    # Single atomic disk write for all updated ticker profiles
-    if universe:
-        save_ticker_profiles(profiles_cache)
+    if updated_syms:
+        _merge_and_save_scanned_profiles(profiles_cache, updated_syms)
 
     buy_signals.sort(key=lambda s: (s["score"], s["matched_count"]), reverse=True)
     buy_alerts = [s["message"] for s in buy_signals]
 
-    # Held / Bought Positions Check (Intraday Low Stop Loss, Target Exit, SMA20 Exit)
     for sym, pos in holdings.items():
         df = raw_map.get(sym)
         df_1h = h1_map.get(sym)
@@ -2683,25 +2993,44 @@ async def evaluate_market(
         chart_df = df_4h if (df_4h is not None and len(df_4h) >= 15) else df
         tf_lbl = "4H" if (df_4h is not None and len(df_4h) >= 15) else "1D"
 
-        # Inspect intraday range strictly after entry timestamp so stop-loss wicks are caught immediately
         intraday_src = df_1h if (df_1h is not None and not df_1h.empty) else chart_df
         intraday_low = close_px
         intraday_high = close_px
+        hit_stop_first = False
+        hit_target_first = False
         if intraday_src is not None and not intraday_src.empty:
             src_idx = _to_naive_et_index(intraday_src.index)
             bought_ts = _to_naive_et_timestamp(entry_dt)
             if bought_ts is not None:
-                post_entry = intraday_src.loc[src_idx >= np.datetime64(bought_ts)]
-                if not post_entry.empty:
-                    intraday_low = float(post_entry["low"].min())
-                    intraday_high = float(post_entry["high"].max())
-                    close_px = float(post_entry["close"].iloc[-1])
+                # If date-only YYYY-MM-DD was provided, start monitoring after that session's close (16:00 ET)
+                if len(str(entry_dt).strip()) <= 10:
+                    bought_ts = bought_ts.normalize() + pd.Timedelta(hours=16)
+                post_entry = intraday_src.loc[src_idx > np.datetime64(bought_ts)]
             else:
-                intraday_low = float(intraday_src["low"].iloc[-1])
-                intraday_high = float(intraday_src["high"].iloc[-1])
+                post_entry = intraday_src.iloc[-1:]
 
-        if stop_price is not None and (close_px <= float(stop_price) or intraday_low <= float(stop_price)):
-            fill_px = min(close_px, float(stop_price))
+            trigger_fill_px: Optional[float] = None
+            if not post_entry.empty:
+                intraday_low = float(post_entry["low"].min())
+                intraday_high = float(post_entry["high"].max())
+                close_px = float(post_entry["close"].iloc[-1])
+                for _, bar in post_entry.iterrows():
+                    b_open = float(bar["open"])
+                    b_low = float(bar["low"])
+                    b_high = float(bar["high"])
+                    if stop_price is not None and b_low <= float(stop_price):
+                        hit_stop_first = True
+                        intraday_low = b_low
+                        trigger_fill_px = min(b_open, float(stop_price)) if b_open < float(stop_price) else float(stop_price)
+                        break
+                    if target_price is not None and b_high >= float(target_price):
+                        hit_target_first = True
+                        intraday_high = b_high
+                        trigger_fill_px = max(b_open, float(target_price)) if b_open > float(target_price) else float(target_price)
+                        break
+
+        if stop_price is not None and (hit_stop_first or (not hit_target_first and close_px <= float(stop_price))):
+            fill_px = trigger_fill_px if trigger_fill_px is not None else min(close_px, float(stop_price))
             msg = f"{TAG_STOPLOSS} — <b>{sym}</b> | Price: <code>${fill_px:.2f}</code> (Low <code>${intraday_low:.2f}</code>) &le; Stop Loss: <code>${float(stop_price):.2f}</code> (Entry: <code>${entry_px:.2f}</code>)"
             stoploss_alerts.append(msg)
             exit_signals.append({
@@ -2717,8 +3046,8 @@ async def evaluate_market(
                 "tf_label": tf_lbl,
                 "message": msg,
             })
-        elif target_price is not None and (close_px >= float(target_price) or intraday_high >= float(target_price)):
-            fill_px = max(close_px, float(target_price))
+        elif target_price is not None and (hit_target_first or close_px >= float(target_price)):
+            fill_px = trigger_fill_px if trigger_fill_px is not None else max(close_px, float(target_price))
             msg = f"{TAG_TARGET} — <b>{sym}</b> | Price: <code>${fill_px:.2f}</code> (High <code>${intraday_high:.2f}</code>) &ge; Exit Target: <code>${float(target_price):.2f}</code> (Entry: <code>${entry_px:.2f}</code>)"
             target_alerts.append(msg)
             exit_signals.append({
@@ -2730,22 +3059,6 @@ async def evaluate_market(
                 "stop": float(stop_price) if stop_price else round(entry_px * 0.96, 2),
                 "stop_time": stop_dt,
                 "target": float(target_price),
-                "chart_df": chart_df,
-                "tf_label": tf_lbl,
-                "message": msg,
-            })
-        elif bool(last.get("sell_sma20_cross", False)):
-            msg = f"{TAG_SELL} — <b>{sym}</b> | Price: <code>${close_px:.2f}</code> crossed below SMA20 <code>${sma20:.2f}</code> (Entry: <code>${entry_px:.2f}</code>)"
-            sell_alerts.append(msg)
-            exit_signals.append({
-                "ticker": sym,
-                "exit_type": "SMA20_EXIT",
-                "current_price": close_px,
-                "entry": entry_px,
-                "entry_time": entry_dt,
-                "stop": float(stop_price) if stop_price else round(entry_px * 0.96, 2),
-                "stop_time": stop_dt,
-                "target": float(target_price) if target_price else round(entry_px * 1.05, 2),
                 "chart_df": chart_df,
                 "tf_label": tf_lbl,
                 "message": msg,
@@ -2838,7 +3151,6 @@ async def analyze_single_ticker_with_chart(ticker: str) -> tuple[str, Optional[i
     vol_ratio = 1.0
     sig_df = pd.DataFrame()
 
-    # --- 1. Daily Setup & Trend Evaluation ---
     if not daily_df.empty:
         sig_df = evaluate_setup_signals(daily_df, vol_mult=max(1.35, float(ticker_prof.get("vol_mult", 1.20)) + 0.25))
         last_d = sig_df.iloc[-1]
@@ -2899,7 +3211,6 @@ async def analyze_single_ticker_with_chart(ticker: str) -> tuple[str, Optional[i
                 f"Daily High-Confluence: {', '.join(missing_d_parts) if missing_d_parts else 'criteria not met'}"
             )
 
-    # --- 2. 4H Boroden Fibonacci Engine Evaluation (Deduplicated Historical Learning) ---
     boroden_active = False
     b4h_df = pd.DataFrame()
     trades_df = pd.DataFrame()
@@ -2925,7 +3236,7 @@ async def analyze_single_ticker_with_chart(ticker: str) -> tuple[str, Optional[i
         tp2 = float(last_4h["boroden_4h_tp2"])
         tp3 = float(last_4h["boroden_4h_tp3"])
 
-        d_ok = bool(last_4h["daily_trend_ok"])
+        d_ok = bool(last_4h["daily_trend_ok"]) and (ema50 <= 0 or cur_px >= ema50)
         if d_ok:
             passed_reasons.append(f"Daily Trend Filter: Price (<code>${cur_px:.2f}</code>) &ge; Daily EMA50 (<code>${ema50:.2f}</code>)")
         else:
@@ -2998,7 +3309,6 @@ async def analyze_single_ticker_with_chart(ticker: str) -> tuple[str, Optional[i
     if chart_source_df is not None and len(chart_source_df) >= 35 and detect_butterfly_harmonic(chart_source_df) is not None:
         matched_strategies.append("Bullish Butterfly Harmonic")
 
-    # --- 3. Anchor Entry Candle & Timeframe-Matched Swing-Low Stop Loss ---
     holdings = load_holdings()
     active_pos = holdings.get(sym)
 
@@ -3040,7 +3350,6 @@ async def analyze_single_ticker_with_chart(ticker: str) -> tuple[str, Optional[i
         tp2 = round(entry_px + (2.5 * tp_mult) * risk, 2)
         tp3 = round(entry_px + (3.5 * tp_mult) * risk, 2)
 
-    # --- 4. Compute Confluence Score (Weighted by THIS Ticker's DNA) ---
     rr_ratio = (tp1 - entry_px) / max(entry_px - stop_px, 1e-6) if (entry_px > stop_px and tp1 > entry_px) else 1.5
     rr_bonus = min(1.0, max(0.0, (rr_ratio - 1.2) / 2.3))
     vol_bonus = min(1.0, max(0.0, (vol_ratio - 1.0) / 1.5))
@@ -3135,11 +3444,14 @@ async def analyze_single_ticker_with_chart(ticker: str) -> tuple[str, Optional[i
         stop_ts,
     )
 
-    short_caption = (
-        f"{decision_header}\n"
-        f"{score_line}\n"
-        f"• <b>Entry ({entry_date_label}):</b> <code>${entry_px:.2f}</code> | <b>Stop Loss ({stop_date_label} Low):</b> <code>${stop_px:.2f}</code> (-{risk_pct:.2f}%)\n"
-        f"• <b>Exits:</b> TP1 <code>${tp1:.2f}</code> | TP2 <code>${tp2:.2f}</code> | TP3 <code>${tp3:.2f}</code>"
+    short_caption = _truncate_telegram(
+        (
+            f"{decision_header}\n"
+            f"{score_line}\n"
+            f"• <b>Entry ({entry_date_label}):</b> <code>${entry_px:.2f}</code> | <b>Stop Loss ({stop_date_label} Low):</b> <code>${stop_px:.2f}</code> (-{risk_pct:.2f}%)\n"
+            f"• <b>Exits:</b> TP1 <code>${tp1:.2f}</code> | TP2 <code>${tp2:.2f}</code> | TP3 <code>${tp3:.2f}</code>"
+        ),
+        TELEGRAM_CAPTION_MAX_LEN,
     )
     return full_msg, chart_buf, short_caption
 
@@ -3150,7 +3462,7 @@ async def analyze_single_ticker_with_chart(ticker: str) -> tuple[str, Optional[i
 async def run_hourly_entry_scan(app: Application, manual_chat_id: Optional[int | str] = None) -> None:
     """
     Runs every 1 hour during US market session (or immediately on /scan):
-    1. Upgrades each ticker's isolated DNA profile in a single batched write & scans for Entry alerts.
+    1. Upgrades each ticker's isolated DNA profile in a single batched merge & scans for Entry alerts.
     2. Persists deduplication keys in `alert_state.json` so restarts & weekends never re-fire alerts.
     """
     chat_id = manual_chat_id or _resolve_alert_chat_id(app)
@@ -3162,137 +3474,154 @@ async def run_hourly_entry_scan(app: Application, manual_chat_id: Optional[int |
         logger.info("Market closed (weekend/after-hours); skipping automated 1H entry scan.")
         return
 
-    universe = await asyncio.to_thread(get_sp500_and_nasdaq100_tickers)
-    holdings = load_holdings()
-    alerts = await evaluate_market(universe, holdings, include_4h_boroden=True)
-
-    auto_buy = bool(app.bot_data.get("auto_buy_enabled", AUTO_BUY_DEFAULT))
-    alert_state = load_alert_state()
-    recent_alerted = alert_state["entry_alerts"]
-    state_dirty = False
-
-    new_buy_signals: list[dict[str, Any]] = []
-    for sig in alerts["buy_signals"]:
-        dedup_key = f"{sig['ticker']}:{sig['rating']}:{sig['bar_id']}"
-        if manual_chat_id is not None or dedup_key not in recent_alerted:
-            new_buy_signals.append(sig)
-
-    for sig in new_buy_signals[:10]:
-        dedup_key = f"{sig['ticker']}:{sig['rating']}:{sig['bar_id']}"
-        recent_alerted[dedup_key] = datetime.now(ET_TZ).isoformat()
-        state_dirty = True
-
-        sym = sig["ticker"]
-        entry_px = float(sig["entry"])
-        entry_ts = sig.get("entry_time")
-        stop_px = float(sig["stop"])
-        stop_ts = sig.get("stop_time")
-        tp1_px = float(sig["tp1"])
-        tp2_px = float(sig["tp2"])
-        tp3_px = float(sig["tp3"])
-
-        auto_bought_note = ""
-        current_holdings = load_holdings()
-        if auto_buy and sym not in current_holdings and len(current_holdings) < MAX_AUTO_OPEN_POSITIONS and entry_px > 0:
-            alloc_dollars = STARTING_CAPITAL * AUTO_POSITION_PCT
-            shares = round(alloc_dollars / entry_px, 2)
-            if shares > 0:
-                norm_e = _to_naive_et_timestamp(entry_ts)
-                norm_s = _to_naive_et_timestamp(stop_ts)
-                bought_dt_str = norm_e.isoformat() if norm_e is not None else None
-                stop_dt_str = norm_s.isoformat() if norm_s is not None else None
-                record_position_buy(
-                    sym,
-                    entry_px,
-                    stop_px,
-                    tp1_px,
-                    shares,
-                    strategy=sig["strategy"],
-                    bought_date=bought_dt_str,
-                    stop_date=stop_dt_str,
-                )
-                auto_bought_note = (
-                    f"\n🤖 <b>Auto-Bought:</b> <code>{shares:g}</code> shares @ <code>${entry_px:.2f}</code> "
-                    f"(4H Exit/Stop monitor active)"
-                )
-
-        chart_title = f"ENTRY [{sig['rating']} {sig['score']:.1f}] ({sig['matched_count']} Strats)"
-        chart_buf = await asyncio.to_thread(
-            generate_trade_candlestick_chart,
-            sym,
-            sig["chart_df"],
-            entry_px,
-            stop_px,
-            tp1_px,
-            tp2_px,
-            tp3_px,
-            entry_px,
-            sig["tf_label"],
-            chart_title,
-            55,
-            entry_ts,
-            stop_ts,
-        )
-        caption = _truncate_telegram(sig["message"] + auto_bought_note, TELEGRAM_CAPTION_MAX_LEN)
-        if chart_buf is not None:
-            await app.bot.send_photo(chat_id=chat_id, photo=chart_buf, caption=caption, parse_mode="HTML")
+    if _SCAN_LOCK.locked():
+        if manual_chat_id is not None:
+            await app.bot.send_message(
+                chat_id=chat_id,
+                text="⏳ A market scan is already in progress — please wait for it to finish.",
+            )
         else:
-            await app.bot.send_message(chat_id=chat_id, text=caption, parse_mode="HTML")
-        await asyncio.sleep(0.5)
+            logger.info("Skipping scheduled 1H scan because another scan is already running.")
+        return
 
-    now_et = datetime.now(ET_TZ)
-    heads_up_seen = alert_state["heads_up_alerts"]
-    fresh_heads_up: list[str] = []
+    async with _SCAN_LOCK:
+        universe = await asyncio.to_thread(get_sp500_and_nasdaq100_tickers)
+        holdings = load_holdings()
+        alerts = await evaluate_market(universe, holdings, include_4h_boroden=True)
 
-    for hu in alerts.get("heads_up", []):
-        sym = hu["ticker"]
-        last_sent_iso = heads_up_seen.get(sym)
-        if manual_chat_id is None and last_sent_iso:
-            try:
-                prev_dt = datetime.fromisoformat(last_sent_iso)
-                if prev_dt.tzinfo is None:
-                    prev_dt = prev_dt.replace(tzinfo=ET_TZ)
-                if (now_et - prev_dt) < timedelta(hours=HEADS_UP_COOLDOWN_HOURS):
-                    continue
-            except ValueError:
-                pass
-        heads_up_seen[sym] = now_et.isoformat()
-        state_dirty = True
-        joined_notes = "; ".join(html.escape(n) for n in hu["notes"])
-        fresh_heads_up.append(
-            f"• <b>{sym}</b> ({hu['tf_label']} @ <code>${hu['price']:.2f}</code>): {joined_notes}"
-        )
+        auto_buy = bool(app.bot_data.get("auto_buy_enabled", AUTO_BUY_DEFAULT))
+        alert_state = load_alert_state()
+        recent_alerted = alert_state["entry_alerts"]
+        state_dirty = False
 
-    if state_dirty:
-        save_alert_state(alert_state)
+        new_buy_signals: list[dict[str, Any]] = []
+        for sig in alerts["buy_signals"]:
+            dedup_key = f"{sig['ticker']}:{sig['bar_id']}"
+            if manual_chat_id is not None or dedup_key not in recent_alerted:
+                new_buy_signals.append(sig)
 
-    if fresh_heads_up:
-        header = (
-            "👀 <b>HEADS-UP PATTERN &amp; EMA WATCH (Low-Priority Alert)</b>\n"
-            "<i>Early setups forming (no confirmed entry trigger yet — watch for breakout/reclaim):</i>\n\n"
-        )
-        body = "\n".join(fresh_heads_up[:18])
-        extra = f"\n<i>...and {len(fresh_heads_up) - 18} more on watch</i>" if len(fresh_heads_up) > 18 else ""
-        await app.bot.send_message(
-            chat_id=chat_id,
-            text=_truncate_telegram(header + body + extra),
-            parse_mode="HTML",
-            disable_notification=True,
-        )
+        for sig in new_buy_signals[:10]:
+            dedup_key = f"{sig['ticker']}:{sig['bar_id']}"
+            recent_alerted[dedup_key] = datetime.now(ET_TZ).isoformat()
+            state_dirty = True
 
-    if manual_chat_id is not None and not new_buy_signals and not fresh_heads_up:
-        sections = [
-            _format_section("1. Entry Alerts", alerts["buy"], "No active entry signals."),
-            _format_section("2. Stop Loss Alerts", alerts["stoploss"], "No stop losses hit."),
-            _format_section("3. Target Alerts", alerts["target"], "No targets hit."),
-            _format_section("4. Sell Alerts (SMA20 Cross)", alerts["sell"], "No sell signals."),
-            _format_section("5. Heads-Up Watch (EMA / Patterns)", [], "No early pattern or EMA pre-cross setups."),
-        ]
-        await app.bot.send_message(
-            chat_id=chat_id,
-            text=_truncate_telegram("\n\n".join(sections)),
-            parse_mode="HTML",
-        )
+            sym = sig["ticker"]
+            entry_px = float(sig["entry"])
+            entry_ts = sig.get("entry_time")
+            stop_px = float(sig["stop"])
+            stop_ts = sig.get("stop_time")
+            tp1_px = float(sig["tp1"])
+            tp2_px = float(sig["tp2"])
+            tp3_px = float(sig["tp3"])
+
+            auto_bought_note = ""
+            current_holdings = load_holdings()
+            if (
+                auto_buy
+                and float(sig.get("score", 0.0)) >= MIN_AUTO_BUY_SCORE
+                and sym not in current_holdings
+                and len(current_holdings) < MAX_AUTO_OPEN_POSITIONS
+                and entry_px > 0
+            ):
+                alloc_dollars = STARTING_CAPITAL * AUTO_POSITION_PCT
+                shares = round(alloc_dollars / entry_px, 2)
+                if shares > 0:
+                    norm_s = _to_naive_et_timestamp(stop_ts)
+                    # Use actual execution time so intraday stop monitoring only inspects bars after entry
+                    bought_dt_str = datetime.now(ET_TZ).isoformat()
+                    stop_dt_str = norm_s.isoformat() if norm_s is not None else None
+                    record_position_buy(
+                        sym,
+                        entry_px,
+                        stop_px,
+                        tp1_px,
+                        shares,
+                        strategy=sig["strategy"],
+                        bought_date=bought_dt_str,
+                        stop_date=stop_dt_str,
+                    )
+                    auto_bought_note = (
+                        f"\n🤖 <b>Auto-Bought:</b> <code>{shares:g}</code> shares @ <code>${entry_px:.2f}</code> "
+                        f"(4H Exit/Stop monitor active)"
+                    )
+
+            chart_title = f"ENTRY [{sig['rating']} {sig['score']:.1f}] ({sig['matched_count']} Strats)"
+            chart_buf = await asyncio.to_thread(
+                generate_trade_candlestick_chart,
+                sym,
+                sig["chart_df"],
+                entry_px,
+                stop_px,
+                tp1_px,
+                tp2_px,
+                tp3_px,
+                entry_px,
+                sig["tf_label"],
+                chart_title,
+                55,
+                entry_ts,
+                stop_ts,
+            )
+            caption = _truncate_telegram(sig["message"] + auto_bought_note, TELEGRAM_CAPTION_MAX_LEN)
+            if chart_buf is not None:
+                await app.bot.send_photo(chat_id=chat_id, photo=chart_buf, caption=caption, parse_mode="HTML")
+            else:
+                await app.bot.send_message(chat_id=chat_id, text=caption, parse_mode="HTML")
+            await asyncio.sleep(0.5)
+
+        now_et = datetime.now(ET_TZ)
+        heads_up_seen = alert_state["heads_up_alerts"]
+        fresh_heads_up: list[str] = []
+
+        for hu in alerts.get("heads_up", []):
+            sym = hu["ticker"]
+            last_sent_iso = heads_up_seen.get(sym)
+            if manual_chat_id is None and last_sent_iso:
+                try:
+                    prev_dt = datetime.fromisoformat(last_sent_iso)
+                    if prev_dt.tzinfo is None:
+                        prev_dt = prev_dt.replace(tzinfo=ET_TZ)
+                    if (now_et - prev_dt) < timedelta(hours=HEADS_UP_COOLDOWN_HOURS):
+                        continue
+                except ValueError:
+                    pass
+            heads_up_seen[sym] = now_et.isoformat()
+            state_dirty = True
+            joined_notes = "; ".join(html.escape(n) for n in hu["notes"])
+            fresh_heads_up.append(
+                f"• <b>{sym}</b> ({hu['tf_label']} @ <code>${hu['price']:.2f}</code>): {joined_notes}"
+            )
+
+        if state_dirty:
+            save_alert_state(alert_state)
+
+        if fresh_heads_up:
+            header = (
+                "👀 <b>HEADS-UP PATTERN &amp; EMA WATCH (Low-Priority Alert)</b>\n"
+                "<i>Early setups forming (no confirmed entry trigger yet — watch for breakout/reclaim):</i>\n\n"
+            )
+            body = "\n".join(fresh_heads_up[:18])
+            extra = f"\n<i>...and {len(fresh_heads_up) - 18} more on watch</i>" if len(fresh_heads_up) > 18 else ""
+            await app.bot.send_message(
+                chat_id=chat_id,
+                text=_truncate_telegram(header + body + extra),
+                parse_mode="HTML",
+                disable_notification=True,
+            )
+
+        if manual_chat_id is not None and not new_buy_signals and not fresh_heads_up:
+            sections = [
+                _format_section("1. Entry Alerts", alerts["buy"], "No active entry signals."),
+                _format_section("2. Stop Loss Alerts", alerts["stoploss"], "No stop losses hit."),
+                _format_section("3. Target Alerts", alerts["target"], "No targets hit."),
+                _format_section("4. Sell Alerts (SMA20 Cross)", alerts["sell"], "No sell signals."),
+                _format_section("5. Heads-Up Watch (EMA / Patterns)", [], "No early pattern or EMA pre-cross setups."),
+            ]
+            await app.bot.send_message(
+                chat_id=chat_id,
+                text=_truncate_telegram("\n\n".join(sections)),
+                parse_mode="HTML",
+            )
 
 
 async def run_4h_exit_and_stoploss_monitor(app: Application) -> None:
@@ -3302,7 +3631,8 @@ async def run_4h_exit_and_stoploss_monitor(app: Application) -> None:
     if not chat_id or not holdings or not _is_us_equity_session_open():
         return
 
-    alerts = await evaluate_market([], holdings, include_4h_boroden=True)
+    async with _SCAN_LOCK:
+        alerts = await evaluate_market([], holdings, include_4h_boroden=True)
 
     for sig in alerts["exit_signals"]:
         sym = sig["ticker"]
@@ -3350,20 +3680,54 @@ async def run_4h_exit_and_stoploss_monitor(app: Application) -> None:
     if remaining:
         live_prices = await asyncio.to_thread(get_current_prices, list(remaining.keys()))
         status_lines = ["⏱ <b>4-Hour Bought Position Monitor (Exit / Stop-Loss Check)</b>"]
+        holdings_dirty = False
+        be_updates: dict[str, float] = {}
+
         for sym, pos in remaining.items():
             entry_px = float(pos.get("entry", 0.0))
             stop_px = float(pos.get("stop", 0.0))
             target_px = float(pos.get("target", 0.0))
             shares = float(pos.get("shares", 0.0))
             cur_px = live_prices.get(sym, entry_px)
+
+            initial_risk = float(pos.get("initial_risk", max(entry_px - stop_px, 0.0)))
+            be_note = ""
+            if (
+                initial_risk > 0
+                and stop_px < entry_px
+                and cur_px >= entry_px + (BREAKEVEN_R_TRIGGER * initial_risk)
+            ):
+                stop_px = round(entry_px, 4)
+                pos["stop"] = stop_px
+                pos["initial_risk"] = round(initial_risk, 4)
+                holdings_dirty = True
+                be_updates[sym] = stop_px
+                be_note = " 🔒 <b>[Stop &rarr; Breakeven]</b>"
+
             pnl = (cur_px - entry_px) * shares
             to_stop_pct = ((cur_px - stop_px) / cur_px * 100.0) if cur_px > 0 else 0.0
             to_target_pct = ((target_px - cur_px) / cur_px * 100.0) if cur_px > 0 else 0.0
             status_lines.append(
                 f"• <b>{sym}</b>: Cur <code>${cur_px:.2f}</code> ({_fmt_signed_money(pnl)}) | "
                 f"Stop <code>${stop_px:.2f}</code> ({to_stop_pct:.1f}% buffer) | "
-                f"Exit Target <code>${target_px:.2f}</code> ({to_target_pct:+.1f}% away)"
+                f"Exit Target <code>${target_px:.2f}</code> ({to_target_pct:+.1f}% away){be_note}"
             )
+
+        if holdings_dirty:
+            with _STATE_LOCK:
+                latest_holdings = load_holdings()
+                for sym, new_stop in be_updates.items():
+                    if sym in latest_holdings:
+                        latest_holdings[sym]["stop"] = new_stop
+                        latest_holdings[sym]["initial_risk"] = remaining[sym]["initial_risk"]
+                save_holdings(latest_holdings)
+
+                journal = load_journal()
+                for item in reversed(journal):
+                    j_sym = str(item.get("ticker", "")).upper()
+                    if j_sym in be_updates and (item.get("exit") is None or item.get("exit") == ""):
+                        item["stop"] = be_updates[j_sym]
+                save_journal(journal)
         await app.bot.send_message(
             chat_id=chat_id,
             text=_truncate_telegram("\n".join(status_lines)),
@@ -3425,7 +3789,7 @@ async def _telegram_error_handler(update: object, context: ContextTypes.DEFAULT_
 
 
 # ==============================================================================
-# 9. TELEGRAM BOT COMMAND HANDLERS
+# 9. TELEGRAM BOT COMMAND & NATURAL-TEXT HANDLERS
 # ==============================================================================
 def _remember_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_chat:
@@ -3443,17 +3807,339 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• <b>1-Hour Auto-Scan:</b> Upgrades each ticker's isolated DNA profile &amp; sends ranked chart alerts (HIGH &gt;85, MEDIUM 75-85, LOW 60-75)\n"
         "• <b>4-Hour Exit / Stop Monitor:</b> Checks bought positions every 4h &amp; upgrades ticker DNA on every win/loss\n"
         f"• <b>Auto-Buy Tracking:</b> <code>{auto_state}</code> (toggle with <code>/autobuy on</code> or <code>/autobuy off</code>)\n\n"
-        "<b>Commands:</b>\n"
+        "<b>Commands &amp; Quick Keywords:</b>\n"
         "1. Type any ticker (e.g. <code>NVDA</code>, <code>$AAPL</code>, <code>/TSLA</code>) or <code>/boroden TICKER</code> — Candlestick chart + Confluence Score &amp; Ticker DNA\n"
-        "2. <code>/learn [TICKER]</code> — Inspect a ticker's isolated learned parameters, strategy weights &amp; upgrade log\n"
-        "3. <code>/scan</code> — Run immediate scan with ranked chart alerts &amp; Heads-Up Watch\n"
-        "4. <code>/regime</code> — SPY 5Y 200EMA bottom stats &amp; top holdings divergence\n"
-        "5. <code>/report</code> — Generate Weekly Trading Journal PDF\n"
-        "6. <code>/buy TICKER ENTRY STOP TARGET SHARES [YYYY-MM-DD]</code> — Log a bought position\n"
-        "7. <code>/sell TICKER EXIT_PRICE</code> — Close a position &amp; upgrade that ticker's learner\n"
-        "8. <code>/autobuy on|off</code> — Enable/disable auto-buying on 1H entry alerts\n"
+        "2. <code>/sector</code> (or type <code>sector</code>) — See where institutional money is flowing across all 11 S&amp;P sectors\n"
+        "3. <code>/open</code> (or type <code>open</code>) — Show all open positions with live unrealized P&amp;L, stops &amp; targets\n"
+        "4. <code>/close</code> (or type <code>close</code>) — Show recent closed positions with realized P&amp;L &amp; win rate\n"
+        "5. <code>/crossover</code> (or type <code>cross over</code>) — List stocks with confirmed/imminent EMA crossovers (9/21, 21/50, 50/200)\n"
+        "6. <code>/pattern</code> (or type <code>pattern</code>) — List stocks forming Bull Flag, Cup &amp; Handle, Falling Wedge, Double Bottom, or Butterfly\n"
+        "7. <code>/learn [TICKER]</code> — Inspect a ticker's isolated learned parameters &amp; strategy weights\n"
+        "8. <code>/scan</code> — Run immediate scan with ranked chart alerts &amp; Heads-Up Watch\n"
+        "9. <code>/regime</code> — SPY 5Y 200EMA bottom stats &amp; top holdings divergence\n"
+        "10. <code>/report</code> — Generate Weekly Trading Journal PDF\n"
+        "11. <code>/buy TICKER ENTRY STOP TARGET SHARES [YYYY-MM-DD]</code> — Log a bought position\n"
+        "12. <code>/sell TICKER EXIT_PRICE</code> — Close a position &amp; upgrade that ticker's learner\n"
+        "13. <code>/autobuy on|off</code> — Enable/disable auto-buying on 1H entry alerts\n"
     )
     await update.message.reply_text(text, parse_mode="HTML")
+
+
+async def cmd_sector(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show where institutional money is flowing across all 11 S&P 500 sectors."""
+    if not update.message:
+        return
+    _remember_chat(update, context)
+    await update.message.reply_text("Analyzing 11 S&P 500 Sector ETFs for money inflow & rotation...")
+
+    res = await asyncio.to_thread(analyze_sector_money_flow)
+    sectors = res["sectors"]
+    if not sectors:
+        await update.message.reply_text("Could not fetch sector ETF data right now. Try again shortly.")
+        return
+
+    lines = [
+        "💸 <b>SECTOR MONEY FLOW &amp; ROTATION</b>",
+        f"<b>Regime:</b> {html.escape(res['rotation_regime'])}",
+        f"<b>Benchmark (SPY):</b> 5D <code>{res['spy_5d']:+.2f}%</code> | 20D <code>{res['spy_20d']:+.2f}%</code>",
+        "<i>Ranked by 20D Chaikin Money Flow (CMF) + Relative Strength vs SPY:</i>\n",
+    ]
+
+    for idx, s in enumerate(sectors, start=1):
+        lines.append(
+            f"{idx}. <b>{s['ticker']}</b> ({html.escape(s['name'])}) — {s['status']}\n"
+            f"   5D: <code>{s['ret_5d']:+.1f}%</code> | 20D: <code>{s['ret_20d']:+.1f}%</code> "
+            f"(<code>{s['rel_20d']:+.1f}%</code> vs SPY) | CMF: <code>{s['cmf_20']:+.2f}</code> | RVOL: <code>{s['rvol']:.2f}x</code>"
+        )
+
+    top_3 = ", ".join(f"{s['ticker']} ({s['name']})" for s in sectors[:3])
+    bot_2 = ", ".join(f"{s['ticker']} ({s['name']})" for s in sectors[-2:])
+    lines.append(f"\n🔥 <b>Top Inflow Leaders:</b> {html.escape(top_3)}")
+    lines.append(f"❄️ <b>Outflow / Avoid:</b> {html.escape(bot_2)}")
+
+    await _reply_long_html(update, "\n".join(lines))
+
+
+async def cmd_open(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show all currently open positions with live prices, stops, targets, and unrealized P&L."""
+    if not update.message:
+        return
+    _remember_chat(update, context)
+
+    holdings = load_holdings()
+    # Also include any journal entry marked open if missing from holdings.json
+    journal = load_journal()
+    for item in journal:
+        if item.get("exit") is None or item.get("exit") == "":
+            sym = str(item.get("ticker", "")).strip().upper()
+            if sym and sym not in holdings:
+                holdings[sym] = {
+                    "entry": float(item.get("entry", 0.0)),
+                    "stop": float(item.get("stop", 0.0)),
+                    "target": float(item.get("target", 0.0)),
+                    "shares": float(item.get("shares", 0.0)),
+                    "strategy": str(item.get("strategy", "Journal Open")),
+                    "bought_date": str(item.get("bought_date", "")),
+                }
+
+    if not holdings:
+        await update.message.reply_text(
+            "📭 <b>No Open Positions</b>\n"
+            "Log a trade with <code>/buy TICKER ENTRY STOP TARGET SHARES</code> or enable <code>/autobuy on</code>.",
+            parse_mode="HTML",
+        )
+        return
+
+    tickers = sorted(holdings.keys())
+    live_prices = await asyncio.to_thread(get_current_prices, tickers)
+
+    total_cost = 0.0
+    total_value = 0.0
+    lines: list[str] = []
+
+    for idx, sym in enumerate(tickers, start=1):
+        pos = holdings[sym]
+        entry_px = float(pos.get("entry", 0.0))
+        stop_px = float(pos.get("stop", 0.0))
+        target_px = float(pos.get("target", 0.0))
+        shares = float(pos.get("shares", 0.0))
+        strat = str(pos.get("strategy", "Manual"))
+        bought_dt = str(pos.get("bought_date", ""))[:10]
+
+        cur_px = live_prices.get(sym, entry_px)
+        cost_basis = entry_px * shares
+        mkt_value = cur_px * shares
+        pnl_dollars = mkt_value - cost_basis
+        pnl_pct = ((cur_px - entry_px) / entry_px * 100.0) if entry_px > 0 else 0.0
+
+        total_cost += cost_basis
+        total_value += mkt_value
+
+        stop_buf_pct = ((cur_px - stop_px) / cur_px * 100.0) if (cur_px > 0 and stop_px > 0) else 0.0
+        tgt_rem_pct = ((target_px - cur_px) / cur_px * 100.0) if (cur_px > 0 and target_px > 0) else 0.0
+        pnl_icon = "🟢" if pnl_dollars >= 0 else "🔴"
+
+        lines.append(
+            f"{idx}. {pnl_icon} <b>{html.escape(sym)}</b> ({shares:g} sh @ <code>${entry_px:.2f}</code>) — "
+            f"Cur: <code>${cur_px:.2f}</code> | P&amp;L: <code>{_fmt_signed_money(pnl_dollars)}</code> (<code>{pnl_pct:+.2f}%</code>)\n"
+            f"   Stop: <code>${stop_px:.2f}</code> ({stop_buf_pct:.1f}% buffer) | "
+            f"Target: <code>${target_px:.2f}</code> ({tgt_rem_pct:+.1f}% away)\n"
+            f"   <i>{html.escape(strat)}{f' | Opened {bought_dt}' if bought_dt else ''}</i>"
+        )
+
+    total_unrealized = total_value - total_cost
+    total_unrealized_pct = (total_unrealized / total_cost * 100.0) if total_cost > 0 else 0.0
+
+    header = (
+        f"📂 <b>OPEN POSITIONS ({len(tickers)} Active)</b>\n"
+        f"<b>Invested:</b> <code>${total_cost:,.2f}</code> | <b>Current Value:</b> <code>${total_value:,.2f}</code>\n"
+        f"<b>Total Unrealized P&amp;L:</b> <code>{_fmt_signed_money(total_unrealized)}</code> (<code>{total_unrealized_pct:+.2f}%</code>)\n\n"
+    )
+    await _reply_long_html(update, header + "\n".join(lines))
+
+
+async def cmd_close(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show recent closed positions with realized P&L and win rate."""
+    if not update.message:
+        return
+    _remember_chat(update, context)
+
+    limit = 15
+    if context.args and context.args[0].isdigit():
+        limit = max(1, min(50, int(context.args[0])))
+
+    journal = load_journal()
+    closed_items = [
+        item for item in journal
+        if item.get("exit") is not None and item.get("exit") != ""
+    ]
+
+    if not closed_items:
+        await update.message.reply_text(
+            "📭 <b>No Closed Positions Yet</b>\n"
+            "Close an active trade with <code>/sell TICKER EXIT_PRICE</code>.",
+            parse_mode="HTML",
+        )
+        return
+
+    # Sort by closed_date (fallback bought_date), keeping newest first
+    indexed_closed = list(enumerate(closed_items))
+    indexed_closed.sort(
+        key=lambda pair: (str(pair[1].get("closed_date") or pair[1].get("bought_date") or ""), pair[0]),
+        reverse=True,
+    )
+
+    total_wins = 0
+    total_losses = 0
+    total_realized = 0.0
+    for _, item in indexed_closed:
+        pnl = (float(item.get("exit", 0.0)) - float(item.get("entry", 0.0))) * float(item.get("shares", 0.0))
+        total_realized += pnl
+        if pnl > 0:
+            total_wins += 1
+        elif pnl < 0:
+            total_losses += 1
+
+    total_decided = total_wins + total_losses
+    win_rate = (total_wins / total_decided * 100.0) if total_decided > 0 else 0.0
+
+    lines: list[str] = []
+    for idx, (_, item) in enumerate(indexed_closed[:limit], start=1):
+        sym = str(item.get("ticker", "")).upper()
+        entry_px = float(item.get("entry", 0.0))
+        exit_px = float(item.get("exit", 0.0))
+        shares = float(item.get("shares", 0.0))
+        strat = str(item.get("strategy", "Manual"))
+        opened_dt = str(item.get("bought_date", ""))[:10]
+        closed_dt = str(item.get("closed_date", opened_dt))[:10]
+
+        pnl = (exit_px - entry_px) * shares
+        pnl_pct = ((exit_px - entry_px) / entry_px * 100.0) if entry_px > 0 else 0.0
+        badge = "🟢 WIN" if pnl > 0 else ("🔴 LOSS" if pnl < 0 else "⚪ BE")
+
+        lines.append(
+            f"{idx}. {badge} <b>{html.escape(sym)}</b> ({shares:g} sh) — "
+            f"<code>${entry_px:.2f}</code> &rarr; <code>${exit_px:.2f}</code> | "
+            f"P&amp;L: <code>{_fmt_signed_money(pnl)}</code> (<code>{pnl_pct:+.2f}%</code>)\n"
+            f"   <i>Closed: {closed_dt} (Opened: {opened_dt}) | {html.escape(strat)}</i>"
+        )
+
+    header = (
+        f"📕 <b>RECENT CLOSED POSITIONS (Showing {min(limit, len(indexed_closed))} of {len(indexed_closed)})</b>\n"
+        f"<b>Win Rate:</b> <code>{win_rate:.1f}%</code> ({total_wins}W/{total_losses}L) | "
+        f"<b>Total Realized P&amp;L:</b> <code>{_fmt_signed_money(total_realized)}</code>\n\n"
+    )
+    await _reply_long_html(update, header + "\n".join(lines))
+
+
+async def cmd_crossover(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Scan the market for stocks with confirmed or imminent EMA crossovers (9/21, 21/50, 50/200)."""
+    if not update.message:
+        return
+    _remember_chat(update, context)
+
+    pair_filter = context.args[0].strip() if context.args else ""
+    await update.message.reply_text("Scanning S&P 500 + Nasdaq 100 for bullish EMA crossovers...")
+
+    universe = await asyncio.to_thread(get_sp500_and_nasdaq100_tickers)
+    raw_map = await asyncio.to_thread(fetch_yf_batch_ohlcv, universe, "1y", "1d")
+
+    confirmed_hits: list[dict[str, Any]] = []
+    imminent_hits: list[dict[str, Any]] = []
+
+    for sym in universe:
+        df = raw_map.get(sym)
+        if df is None or len(df) < 55:
+            continue
+        crosses = detect_ema_crossovers(df)
+        if not crosses:
+            continue
+        if pair_filter:
+            crosses = [c for c in crosses if pair_filter in c["pair"] or pair_filter.lower() in c["label"].lower()]
+            if not crosses:
+                continue
+
+        cur_px = float(df["close"].iloc[-1])
+        vol_avg = float(df["volume"].iloc[-20:].mean())
+        rvol = float(df["volume"].iloc[-1]) / vol_avg if vol_avg > 0 else 1.0
+        labels = "; ".join(html.escape(c["label"]) for c in crosses)
+        entry_row = {"ticker": sym, "price": cur_px, "rvol": rvol, "labels": labels}
+
+        if any(c["status"] == "CONFIRMED" for c in crosses):
+            confirmed_hits.append(entry_row)
+        else:
+            imminent_hits.append(entry_row)
+
+    confirmed_hits.sort(key=lambda r: r["rvol"], reverse=True)
+    imminent_hits.sort(key=lambda r: r["rvol"], reverse=True)
+
+    if not confirmed_hits and not imminent_hits:
+        await update.message.reply_text("No bullish EMA crossovers found across the universe right now.")
+        return
+
+    sections = [
+        f"📈 <b>EMA CROSSOVER SCANNER</b> ({len(confirmed_hits)} Confirmed, {len(imminent_hits)} Imminent)"
+    ]
+    if confirmed_hits:
+        c_lines = [
+            f"{i}. <b>{r['ticker']}</b> (<code>${r['price']:.2f}</code> | RVOL <code>{r['rvol']:.2f}x</code>) — {r['labels']}"
+            for i, r in enumerate(confirmed_hits[:30], start=1)
+        ]
+        if len(confirmed_hits) > 30:
+            c_lines.append(f"<i>...and {len(confirmed_hits) - 30} more confirmed</i>")
+        sections.append("<b>⚡ CONFIRMED BULLISH CROSSOVERS:</b>\n" + "\n".join(c_lines))
+
+    if imminent_hits:
+        i_lines = [
+            f"{i}. <b>{r['ticker']}</b> (<code>${r['price']:.2f}</code> | RVOL <code>{r['rvol']:.2f}x</code>) — {r['labels']}"
+            for i, r in enumerate(imminent_hits[:25], start=1)
+        ]
+        if len(imminent_hits) > 25:
+            i_lines.append(f"<i>...and {len(imminent_hits) - 25} more approaching</i>")
+        sections.append("<b>⏳ ABOUT TO CROSS (PRE-CROSS WATCH):</b>\n" + "\n".join(i_lines))
+
+    sections.append("<i>Tip: Type any ticker symbol (e.g. NVDA) to see its full candlestick chart &amp; trade plan.</i>")
+    await _reply_long_html(update, "\n\n".join(sections))
+
+
+async def cmd_pattern(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Scan the market for stocks forming bullish chart patterns (Bull Flag, Cup & Handle, Falling Wedge, Double Bottom, Butterfly)."""
+    if not update.message:
+        return
+    _remember_chat(update, context)
+
+    pat_filter = context.args[0].strip().lower() if context.args else ""
+    await update.message.reply_text("Scanning S&P 500 + Nasdaq 100 for bullish chart patterns...")
+
+    universe = await asyncio.to_thread(get_sp500_and_nasdaq100_tickers)
+    raw_map = await asyncio.to_thread(fetch_yf_batch_ohlcv, universe, "6mo", "1d")
+
+    pattern_hits: list[dict[str, Any]] = []
+    for sym in universe:
+        df = raw_map.get(sym)
+        if df is None or len(df) < 50:
+            continue
+        pats = detect_chart_patterns(df)
+        if not pats:
+            continue
+        if pat_filter:
+            pats = [
+                p for p in pats
+                if pat_filter in p["key"].lower() or pat_filter in p["name"].lower()
+            ]
+            if not pats:
+                continue
+
+        cur_px = float(df["close"].iloc[-1])
+        vol_avg = float(df["volume"].iloc[-20:].mean())
+        rvol = float(df["volume"].iloc[-1]) / vol_avg if vol_avg > 0 else 1.0
+        pattern_hits.append({
+            "ticker": sym,
+            "price": cur_px,
+            "rvol": rvol,
+            "count": len(pats),
+            "labels": "; ".join(html.escape(p["label"]) for p in pats),
+        })
+
+    pattern_hits.sort(key=lambda r: (r["count"], r["rvol"]), reverse=True)
+
+    if not pattern_hits:
+        await update.message.reply_text("No active chart patterns matched across the universe right now.")
+        return
+
+    lines = [
+        f"📐 <b>STOCK CHART PATTERN SCANNER ({len(pattern_hits)} Stocks Found)</b>",
+        "<i>Patterns tracked: Bull Flag, Cup &amp; Handle, Falling Wedge, Double Bottom, Bullish Butterfly:</i>\n",
+    ]
+    for i, r in enumerate(pattern_hits[:40], start=1):
+        lines.append(
+            f"{i}. <b>{r['ticker']}</b> (<code>${r['price']:.2f}</code> | RVOL <code>{r['rvol']:.2f}x</code>) — {r['labels']}"
+        )
+    if len(pattern_hits) > 40:
+        lines.append(f"<i>...and {len(pattern_hits) - 40} more stocks with active patterns</i>")
+
+    lines.append("\n<i>Tip: Type any ticker (e.g. AAPL) to generate its candlestick chart &amp; entry/stop levels.</i>")
+    await _reply_long_html(update, "\n".join(lines))
 
 
 async def cmd_learn(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3494,7 +4180,7 @@ async def cmd_learn(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             f"<b>Strategy Weights on {html.escape(sym)}:</b>\n" + "\n".join(strat_lines) + "\n\n"
             f"<b>Recent Upgrades:</b>\n" + ("\n".join(log_lines) if log_lines else "• None yet")
         )
-        await update.message.reply_text(_truncate_telegram(msg), parse_mode="HTML")
+        await _reply_long_html(update, msg)
         return
 
     profiles = load_ticker_profiles()
@@ -3510,7 +4196,7 @@ async def cmd_learn(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     for p in ranked[:15]:
         sym = html.escape(str(p.get("ticker", "")))
         lines.append(f"• <b>{sym}</b>: <code>{html.escape(format_ticker_learning_summary(p))}</code>")
-    await update.message.reply_text(_truncate_telegram("\n".join(lines)), parse_mode="HTML")
+    await _reply_long_html(update, "\n".join(lines))
 
 
 async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3581,7 +4267,7 @@ async def cmd_regime(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     else:
         lines.append("No leader data available.")
 
-    await update.message.reply_text(_truncate_telegram("\n".join(lines)), parse_mode="HTML")
+    await _reply_long_html(update, "\n".join(lines))
 
 
 async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3611,9 +4297,11 @@ async def cmd_buy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         stop_px = float(context.args[2])
         target_px = float(context.args[3])
         shares = float(context.args[4])
-        bought_date = context.args[5] if len(context.args) >= 6 else None
+        bought_date = context.args[5].strip() if len(context.args) >= 6 else None
+        if bought_date is not None:
+            datetime.strptime(bought_date, "%Y-%m-%d")
     except ValueError:
-        await update.message.reply_text("Invalid number format. Use: /buy NVDA 139.00 135.00 145.20 20 2026-10-26")
+        await update.message.reply_text("Invalid format. Use: /buy NVDA 139.00 135.00 145.20 20 2026-10-26")
         return
 
     df_1h = await asyncio.to_thread(fetch_yf_ohlcv, sym, "60d", "1h")
@@ -3691,10 +4379,34 @@ async def cmd_sell(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def handle_direct_ticker_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handles direct ticker inputs like 'NVDA', '$NVDA', '/NVDA', or '/BRK.B'."""
+    """
+    Handles natural-text keywords ('open', 'close', 'sector', 'cross over', 'pattern')
+    as well as direct ticker inputs like 'NVDA', '$NVDA', '/NVDA', or '/BRK.B'.
+    """
     if not update.message or not update.message.text:
         return
     _remember_chat(update, context)
+
+    clean_phrase = re.sub(r"\s+", " ", update.message.text.strip()).lower()
+
+    # 1. Natural-text keyword routing (works with or without slash)
+    if clean_phrase in ("open", "open position", "open positions", "holdings"):
+        await cmd_open(update, context)
+        return
+    if clean_phrase in ("close", "closed", "close position", "close positions", "closed positions"):
+        await cmd_close(update, context)
+        return
+    if clean_phrase in ("sector", "sectors", "sector flow", "money flow"):
+        await cmd_sector(update, context)
+        return
+    if clean_phrase in ("cross over", "crossover", "crossovers", "ema crossover", "ema cross over", "corssover"):
+        await cmd_crossover(update, context)
+        return
+    if clean_phrase in ("pattern", "patterns", "stock pattern", "stocks pattern", "chart pattern"):
+        await cmd_pattern(update, context)
+        return
+
+    # 2. Direct ticker lookup
     raw_text = update.message.text.strip().split()[0]
     if "@" in raw_text:
         raw_text = raw_text.split("@", 1)[0]
@@ -3731,6 +4443,11 @@ def main() -> None:
     app.add_handler(CommandHandler("help", cmd_start))
     app.add_handler(CommandHandler("scan", cmd_scan))
     app.add_handler(CommandHandler("boroden", cmd_boroden))
+    app.add_handler(CommandHandler("sector", cmd_sector))
+    app.add_handler(CommandHandler("open", cmd_open))
+    app.add_handler(CommandHandler("close", cmd_close))
+    app.add_handler(CommandHandler("crossover", cmd_crossover))
+    app.add_handler(CommandHandler("pattern", cmd_pattern))
     app.add_handler(CommandHandler("learn", cmd_learn))
     app.add_handler(CommandHandler("autobuy", cmd_autobuy))
     app.add_handler(CommandHandler("regime", cmd_regime))
